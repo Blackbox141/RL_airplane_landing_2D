@@ -1,159 +1,170 @@
+# flight_simulation.py
 import pygame
 import numpy as np
 from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 import os
+import glob
 
 from airplane_alt_env import AirplaneAltitudeEnv
 
-# ==========================================
-#  EINSTELLUNGEN
-# ==========================================
-
-# Welches Training willst du laden? (0 = "model_latest.zip")
-RUN_ID = 103
-
-# Basispfad
-BASE_PATH = "/Users/dennis/PycharmProjects/RL Lander V2"
-MODEL_FOLDER = os.path.join(BASE_PATH, "saved_models")
-
-# Automatische Pfad-Ermittlung
-if RUN_ID == 0:
-    MODEL_NAME = "model_latest"
-else:
-    MODEL_NAME = f"model_{RUN_ID}"
-
-MODEL_PATH = os.path.join(MODEL_FOLDER, MODEL_NAME + ".zip")
+BASE_DIR = "./airplane_project_data"
+MODEL_DIR = os.path.join(BASE_DIR, "models")
+VECNORM_DIR = os.path.join(BASE_DIR, "vecnormalize")
 
 
-# ==========================================
-#  UI FUNKTIONEN
-# ==========================================
-def draw_overlay(env, autopilot, sensitivity, manual_thr, manual_pitch, speed_kmh):
-    screen = pygame.display.get_surface()
-    if not screen: return
+def get_latest_run_dir():
+    if not os.path.exists(MODEL_DIR):
+        return None
+    run_paths = glob.glob(os.path.join(MODEL_DIR, "run_*"))
+    if not run_paths:
+        return None
+    run_paths.sort(key=lambda x: int(os.path.basename(x).split("_")[-1]), reverse=True)
+    return run_paths[0]
 
-    if not pygame.font.get_init(): pygame.font.init()
+
+def get_latest_model_and_vecnorm():
+    run_dir = get_latest_run_dir()
+    if not run_dir:
+        return None, None
+
+    zips = glob.glob(os.path.join(run_dir, "*.zip"))
+    if not zips:
+        return None, None
+    model_path = max(zips, key=os.path.getctime)
+
+    run_name = os.path.basename(run_dir)
+    vecnorm_path = os.path.join(VECNORM_DIR, f"{run_name}_vecnorm.pkl")
+    if not os.path.exists(vecnorm_path):
+        vecnorm_path = None
+
+    return model_path, vecnorm_path
+
+
+def draw_overlay(screen, env, autopilot, manual_thr):
+    if not screen:
+        return
+    if not pygame.font.get_init():
+        pygame.font.init()
     font = pygame.font.SysFont("Consolas", 18, bold=True)
 
-    c_bg = (0, 0, 0, 180)
-    c_txt = (255, 255, 255)
-    c_acc = (0, 255, 0) if autopilot else (255, 100, 100)
-
     w, h = screen.get_size()
-    panel_w = 320
-    panel_h = 180
-    panel_x = w - panel_w - 10
-    panel_y = 10
+    bg = pygame.Surface((300, 180))
+    bg.set_alpha(180)
+    bg.fill((0, 0, 0))
+    screen.blit(bg, (w - 310, 10))
+    pygame.draw.rect(screen, (255, 255, 255), (w - 310, 10, 300, 180), 2)
 
-    s = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
-    s.fill(c_bg)
-    screen.blit(s, (panel_x, panel_y))
-    pygame.draw.rect(screen, c_txt, (panel_x, panel_y, panel_w, panel_h), 2)
-
-    # Modell Name anzeigen
-    model_disp = f"Run #{RUN_ID}" if RUN_ID > 0 else "LATEST"
-
+    c_auto = (0, 255, 0) if autopilot else (255, 100, 100)
     lines = [
-        f"MODEL:     {model_disp}",
-        f"MODE:      {'AUTOPILOT' if autopilot else 'MANUAL'}",
-        f"Sensitiv:  {sensitivity:.1f}",
-        f"Throttle:  {manual_thr:.0f}%",
-        f"----------------",
-        f"Alt:       {env.altitude:.1f} m",
-        f"Speed:     {speed_kmh:.0f} km/h",
-        f"V-Speed:   {env.vz:.1f} m/s",
+        (f"MODE: {'AUTOPILOT' if autopilot else 'MANUAL'}", c_auto),
+        (f"Alt: {env.altitude:.1f} m", (255, 255, 255)),
+        (f"Tgt: {env.target_altitude:.0f} m", (255, 255, 0)),
+        (f"Spd: {env.speed * 3.6:.0f} km/h", (255, 255, 255)),
+        (f"Vz:  {env.vertical_speed:.1f} m/s", (255, 255, 255)),
+        (f"Thr: {manual_thr:.0f}%", (255, 255, 255)),
+        (f"Pit: {np.rad2deg(env.pitch):.1f}", (255, 255, 255)),
     ]
 
-    for i, line in enumerate(lines):
-        col = c_acc if "MODE" in line else c_txt
-        if "MODEL" in line: col = (100, 200, 255)
-
-        img = font.render(line, True, col)
-        screen.blit(img, (panel_x + 15, panel_y + 15 + i * 20))
-
-    if env.altitude <= 0:
-        big_font = pygame.font.SysFont("Arial", 50, bold=True)
-        txt = big_font.render("CRASH! 'R' to Reset", True, (255, 0, 0))
-        rect = txt.get_rect(center=(w // 2, h // 2))
-        screen.blit(txt, rect)
+    for i, (txt, col) in enumerate(lines):
+        img = font.render(txt, True, col)
+        screen.blit(img, (w - 295, 20 + i * 22))
 
 
-# ==========================================
-#  MAIN LOOP
-# ==========================================
 def run():
+    model_path, vecnorm_path = get_latest_model_and_vecnorm()
+    print(f"Lade: {model_path}")
+    print(f"VecNormalize: {vecnorm_path}")
+
+    if not model_path or not vecnorm_path:
+        raise FileNotFoundError(
+            "Model oder VecNormalize nicht gefunden. "
+            "Stelle sicher, dass du nach dem Training sowohl model_final.zip als auch run_X_vecnorm.pkl gespeichert hast."
+        )
+
+    # Model laden
+    model = PPO.load(model_path)
+
+    # VecEnv + VecNormalize exakt wie im Training (n_envs=1)
+    def make_env():
+        return AirplaneAltitudeEnv(render_mode="human", enable_scenarios=True, max_episode_steps=3000)
+
+    venv = DummyVecEnv([make_env])
+
+    venv = VecNormalize.load(vecnorm_path, venv)
+    venv.training = False          # keine Running-Stats weiter updaten
+    venv.norm_reward = False       # Rewards fürs Render egal; und stabiler
+
+    # Zugriff auf echte Env für Rendering/Overlay/Target-Änderungen
+    base_env = venv.venv.envs[0]
+
+
+    # Reset (liefert normierte Obs in Batch-Form)
+    obs = venv.reset()
+
+    # --- FIX: pygame initialisieren ---
     pygame.init()
-
-    print(f"Suche Modell: {MODEL_PATH}")
-
-    model = None
-    if os.path.exists(MODEL_PATH):
-        print(f">>> ERFOLG: Modell '{MODEL_NAME}' geladen.")
-        model = PPO.load(MODEL_PATH)
-    else:
-        print(f">>> WARNUNG: Datei nicht gefunden!")
-        print(f"    Erwartet in: {MODEL_FOLDER}")
-        print(f"    Bitte stelle sicher, dass 'train_alt.py' ausgeführt wurde")
-        print(f"    oder benenne dein altes Modell um in 'model_{RUN_ID}.zip'.")
-
-    # Env Setup
-    env = AirplaneAltitudeEnv(render_mode="human")
-    obs, _ = env.reset()
-    env.render(flip=False)
-    pygame.display.flip()
+    base_env.render(flip=True)
 
     running = True
     autopilot = False
-    sensitivity = 1.0
     manual_thr = 50.0
-    crashed = False
-
     clock = pygame.time.Clock()
 
     while running:
         for event in pygame.event.get():
-            if event.type == pygame.QUIT: running = False
+            if event.type == pygame.QUIT:
+                running = False
+
+    running = True
+    autopilot = False
+    manual_thr = 50.0
+    clock = pygame.time.Clock()
+
+    while running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
             if event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_ESCAPE: running = False
-                if event.key == pygame.K_a: autopilot = not autopilot
-                if event.key == pygame.K_r and crashed:
-                    obs, _ = env.reset()
-                    crashed = False
-                    env.altitude = 300
-                if event.key == pygame.K_PERIOD: sensitivity += 0.1
-                if event.key == pygame.K_COMMA: sensitivity = max(0.1, sensitivity - 0.1)
+                if event.key == pygame.K_a:
+                    autopilot = not autopilot
+                if event.key == pygame.K_r:
+                    obs = venv.reset()
+                if event.key == pygame.K_w:
+                    base_env.target_altitude += 100
+                if event.key == pygame.K_s:
+                    base_env.target_altitude -= 100
 
         keys = pygame.key.get_pressed()
-        pitch_cmd = 0.0
-        if keys[pygame.K_UP]: pitch_cmd = 1.0
-        if keys[pygame.K_DOWN]: pitch_cmd = -1.0
-        if keys[pygame.K_t]: manual_thr = min(100, manual_thr + 1.0)
-        if keys[pygame.K_g]: manual_thr = max(0, manual_thr - 1.0)
+        pitch_in = 0.0
+        if keys[pygame.K_UP]:
+            pitch_in = 1.0
+        if keys[pygame.K_DOWN]:
+            pitch_in = -1.0
+        if keys[pygame.K_LSHIFT]:
+            manual_thr = min(100, manual_thr + 1)
+        if keys[pygame.K_LCTRL]:
+            manual_thr = max(0, manual_thr - 1)
 
-        if not crashed:
-            if autopilot and model:
-                action, _ = model.predict(obs, deterministic=True)
-                ki_thr_pct = ((action[1] + 1) / 2) * 100
-                manual_thr = ki_thr_pct
-            else:
-                thr_action = (manual_thr / 50.0) - 1.0
-                action = np.array([pitch_cmd * sensitivity, thr_action], dtype=np.float32)
+        if autopilot:
+            action, _ = model.predict(obs, deterministic=True)  # action ist (1,2) oder (2,)
+            action = np.array(action, dtype=np.float32).reshape(1, -1)
+            manual_thr = ((action[0, 1] + 1) / 2) * 100
+        else:
+            action = np.array([[pitch_in, (manual_thr / 50.0) - 1.0]], dtype=np.float32)
 
-            obs, reward, terminated, truncated, info = env.step(action)
+        obs, rewards, dones, infos = venv.step(action)
 
-            if terminated:
-                crashed = True
-                print("Absturz!")
+        if bool(dones[0]):
+            obs = venv.reset()
 
-        # Render Loop
-        env.render(flip=False)
-        vx_kmh = env.vx * 3.6
-        draw_overlay(env, autopilot, sensitivity, manual_thr, 0, vx_kmh)
+        # Render / Overlay wie zuvor (Darstellung bleibt gleich)
+        base_env.render(flip=False)
+        draw_overlay(base_env.screen, base_env, autopilot, manual_thr)
         pygame.display.flip()
-
         clock.tick(60)
 
-    env.close()
+    base_env.close()
     pygame.quit()
 
 

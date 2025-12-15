@@ -1,314 +1,561 @@
+# airplane_alt_env.py
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
-import pygame
 import math
+import random
+import pygame
 import os
+import warnings
+
+warnings.filterwarnings("ignore")
 
 
 class AirplaneAltitudeEnv(gym.Env):
     metadata = {"render_modes": ["human", "none"], "render_fps": 60}
 
-    def __init__(self, render_mode: str = "none"):
-        super().__init__()
+    def __init__(
+        self,
+        render_mode="none",
+        enable_scenarios=True,
+        max_episode_steps=3000,  # ~150s bei dt=0.05
+    ):
+        super(AirplaneAltitudeEnv, self).__init__()
+
         self.render_mode = render_mode
+        self.enable_scenarios = enable_scenarios
+        self.max_episode_steps = int(max_episode_steps)
 
-        # --- DATEIPFAD ZUM BILD ---
-        # HIER DEIN PFAD:
+        self.screen = None
+        self.clock = None
+        self.width = 1000
+        self.height = 600
+
+        # --- OPTIK (unverändert) ---
         self.image_path = r"/Users/dennis/PycharmProjects/RL Lander V2/Flugzeug.svg"
+        self.plane_img_original = None
+        self.font = None
 
-        # --- PHYSIK ---
-        self.dt = 0.05  # 20 Hz
-        self.g = 9.81
+        self.scenery = []
+        rng = np.random.default_rng()
+        for i in range(0, 5000, 50):
+            obj_type = rng.integers(0, 3)
+            pos_x = i + rng.integers(-10, 10)
+            self.scenery.append((pos_x, obj_type))
+        self.ground_offset_x = 0.0
+
+        # Zusätzliche Deko-Objekte (Wolken) für einen lebendigeren Hintergrund
+        self.clouds = []
+        for i in range(0, 12000, 300):
+            cx = i + rng.integers(-80, 80)
+            cy = rng.integers(20, 220)
+            size = rng.integers(30, 90)
+            self.clouds.append((float(cx), int(cy), int(size)))
+
+        # --- PHYSIK & STEUERUNG (unverändert) ---
+        self.dt = 0.05
+        self.gravity = 9.81
         self.rho = 1.225
         self.mass = 60000.0
         self.wing_area = 122.6
         self.max_thrust = 240000.0
 
-        # Aerodynamik (Verbessert für Loopings)
         self.cd0 = 0.0267
         self.k = 0.0387
         self.cl_alpha = 5.5
-        self.alpha_crit = np.deg2rad(15.0)
+        # Aerodynamik: AoA-Stall (mit Hysterese, damit es weniger "sensibel"/flatterig ist)
+        self.alpha_crit = np.deg2rad(15.0)  # Referenzwert
+        self.alpha_stall_on = np.deg2rad(18.0)   # Stall setzt ein ab ~18°
+        self.alpha_stall_off = np.deg2rad(14.0)  # Stall endet erst wieder unter ~14°
 
-        # Ziele
-        self.target_altitude = 300.0
-        self.cruise_speed = 70.0
-        self.max_steps = 1000000000
+        self.min_speed = 40.0
+        self.max_speed = 350.0
 
-        # Action Space
-        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
-        # Obs Space
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(7,), dtype=np.float32)
+        # Reward-Shaping: Mindestgeschwindigkeit, damit Stall niemals "attraktiv" wird
+        # (kein hartes Physiklimit, nur Reward/Truncation-Logik)
+        self.safe_speed = 80.0        # m/s: darunter wird es deutlich unattraktiv
+        self.safe_speed_hard = 55.0   # m/s: darunter gilt es als kritisch
 
-        # State
-        self.altitude = 300.0
-        self.vx = 70.0
-        self.vz = 0.0
+        # Anti-Festhängen: wenn er lange zu langsam / im Stall bleibt, truncaten wir die Episode
+        self.low_speed_counter = 0
+        self.low_speed_counter_limit = 250  # 250 * 0.05s = 12.5s
+
+        self.max_structural_speed = 333.0
+        self.min_altitude = 0.0
+        self.max_altitude = 80000.0
+
+        # Action: [pitch_stick, throttle_stick] in [-1, 1]
+        self.action_space = spaces.Box(
+            low=np.array([-1.0, -1.0], dtype=np.float32),
+            high=np.array([1.0, 1.0], dtype=np.float32),
+            dtype=np.float32,
+        )
+
+        # Obs: [pitch, speed, altitude, vertical_speed, alt_error]
+        low_obs = np.array([-np.pi, 0, 0, -300, -5000], dtype=np.float32)
+        high_obs = np.array([np.pi, self.max_speed, self.max_altitude, 300, 5000], dtype=np.float32)
+        self.observation_space = spaces.Box(low=low_obs, high=high_obs, dtype=np.float32)
+
+        # Zustand
         self.pitch = 0.0
+        self.speed = 200.0
+        self.altitude = 1000.0
+        self.vertical_speed = 0.0
+        self.target_altitude = 1000.0
+        self.current_scenario = "normal"
+        self.step_counter = 0
+
+        self.vx = 200.0
+        self.vz = 0.0
         self.pitch_rate = 0.0
         self.throttle_actual = 0.5
-        self.ground_offset_x = 0.0
-        self.last_action = np.zeros(2)
 
-        # Grafik
-        self.screen = None
-        self.clock = None
-        self.font = None
-        self.plane_img_original = None  # Zum Speichern des geladenen Bildes
+        # Action tracking
+        self.last_action = np.zeros(2, dtype=np.float32)
+        self.prev_action = np.zeros(2, dtype=np.float32)
 
-        self.scenery = []
-        for i in range(0, 1000, 50):
-            obj_type = self.np_random.integers(0, 3)
-            pos_x = i + self.np_random.integers(-10, 10)
-            self.scenery.append((pos_x, obj_type))
+        self.is_stalled_state = False
+        self.last_pitch_input = 0.0
+        self.last_throttle = 0.5
 
-    def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
+        # Ziel-Streak
+        self.on_target_streak = 0
 
-        # Entscheidung: Normaler Start oder EXTREM-Szenario?
-        # 30% Chance auf Chaos, damit er Loopings/Stalls abfangen lernt
-        scenario = self.np_random.choice(["normal", "extreme"], p=[0.7, 0.3])
+        # Für Progress-Reward (schnelleres Anfliegen der Zielhöhe)
+        self.prev_abs_error = None
 
-        if scenario == "normal":
-            self.altitude = self.np_random.uniform(100.0, 500.0)
-            self.vx = self.np_random.uniform(60.0, 80.0)
-            self.vz = self.np_random.uniform(-2.0, 2.0)
-            self.pitch = np.deg2rad(self.np_random.uniform(-5.0, 5.0))
-        else:
-            # EXTREM: Nase steil hoch/runter oder fast Strömungsabriss
-            mode = self.np_random.choice(["nose_high", "nose_low", "low_speed"])
-
-            if mode == "nose_high":
-                self.altitude = self.np_random.uniform(200.0, 400.0)
-                self.vx = self.np_random.uniform(60.0, 90.0)
-                # Bis zu 45 Grad Nase hoch!
-                self.pitch = np.deg2rad(self.np_random.uniform(20.0, 45.0))
-                self.vz = 10.0  # Steigt bereits
-
-            elif mode == "nose_low":
-                self.altitude = self.np_random.uniform(400.0, 600.0)
-                self.vx = self.np_random.uniform(80.0, 110.0)  # Schnell
-                # Bis zu 30 Grad Sturzflug
-                self.pitch = np.deg2rad(self.np_random.uniform(-30.0, -10.0))
-                self.vz = -10.0
-
-            elif mode == "low_speed":
-                self.altitude = 400.0
-                # Gefährlich langsam -> kurz vor Stall
-                self.vx = self.np_random.uniform(50.0, 58.0)
-                self.pitch = np.deg2rad(5.0)
-                self.vz = -2.0
-
-        self.pitch_rate = 0.0
-        self.throttle_actual = 0.5
-        self.last_action = np.zeros(2)
-        self.ground_offset_x = 0.0
-
-        return self._get_obs(np.zeros(2)), {}
-
-    def _get_obs(self, action):
-        return np.array([
-            (self.altitude - self.target_altitude) / 100.0,
-            self.vz / 20.0,
-            self.pitch,
-            self.throttle_actual,
-            (self.vx - self.cruise_speed) / 50.0,
-            action[0],
-            action[1]
-        ], dtype=np.float32)
+    def _get_obs(self):
+        return np.array(
+            [
+                self.pitch,
+                self.speed,
+                self.altitude,
+                self.vertical_speed,
+                self.target_altitude - self.altitude,
+            ],
+            dtype=np.float32,
+        )
 
     def step(self, action):
+        self.step_counter += 1
+
+        # Track action deltas (für Smoothness-Penalty)
+        self.prev_action = self.last_action.copy()
+
         stick_pitch = float(np.clip(action[0], -1.0, 1.0))
         stick_throttle = float(np.clip(action[1], -1.0, 1.0))
-        target_thr = (stick_throttle + 1.0) / 2.0
+        self.last_pitch_input = stick_pitch
+        self.last_action = np.array([stick_pitch, stick_throttle], dtype=np.float32)
 
-        # Engine Lag
-        if self.throttle_actual < target_thr:
-            self.throttle_actual += 0.5 * self.dt
-        else:
-            self.throttle_actual -= 0.5 * self.dt
+        # --- PHYSIK (unverändert) ---
+        target_thr = (stick_throttle + 1.0) / 2.0
+        self.throttle_actual += (target_thr - self.throttle_actual) * 0.4 * self.dt
         self.throttle_actual = np.clip(self.throttle_actual, 0.0, 1.0)
+        self.last_throttle = self.throttle_actual
 
         thrust = self.throttle_actual * self.max_thrust
-        v = np.sqrt(self.vx ** 2 + self.vz ** 2)
-        if v < 0.1: v = 0.1  # Schutz vor 0
+        v = np.sqrt(self.vx**2 + self.vz**2)
+        if v < 0.1:
+            v = 0.1
 
-        # Flugbahnwinkel
         gamma = np.arctan2(self.vz, self.vx)
-
-        # --- VERBESSERTE PHYSIK (AoA Normalisierung) ---
-        # Anstellwinkel (Alpha) ist die Differenz zwischen Nase und Flugbahn.
-        # Wir nutzen atan2 von sin/cos, um den Winkel sauber zwischen -PI und PI zu halten.
-        # Das verhindert seltsame Sprünge beim Überschlag.
         alpha = math.atan2(math.sin(self.pitch - gamma), math.cos(self.pitch - gamma))
 
-        # Aero Koeffizienten
-        # Wir nutzen eine sigmoid-artige Funktion für den Stall statt harter Kante,
-        # damit die Physik nicht "springt".
-
-        # Linearer Lift Bereich
         cl_linear = 0.2 + self.cl_alpha * alpha
 
-        # Stall Dämpfung: Wenn Alpha > 15 Grad, sinkt der Lift drastisch
-        stall_start = self.alpha_crit
-        if abs(alpha) < stall_start:
+        # --------------------------------------------------
+        # Stall-Logik (AoA-basiert, aber weniger sensibel):
+        # - Stall wird durch zu hohe Anstellwinkel ausgelöst
+        # - Hysterese verhindert Flattern: ON bei alpha_stall_on, OFF erst bei alpha_stall_off
+        # --------------------------------------------------
+        if (not self.is_stalled_state) and (abs(alpha) >= self.alpha_stall_on):
+            self.is_stalled_state = True
+        elif self.is_stalled_state and (abs(alpha) <= self.alpha_stall_off):
+            self.is_stalled_state = False
+
+        if not self.is_stalled_state:
             cl = cl_linear
-            cd = self.cd0 + self.k * (cl ** 2)
-            is_stalled = False
+            cd = self.cd0 + self.k * (cl**2)
+            q = 0.5 * self.rho * (v**2)
+            lift = q * self.wing_area * cl
+            drag = q * self.wing_area * cd
+
+            fx = thrust * np.cos(self.pitch) - drag * np.cos(gamma) - lift * np.sin(gamma)
+            fz = thrust * np.sin(self.pitch) - drag * np.sin(gamma) + lift * np.cos(gamma) - self.mass * self.gravity
+
+            # Passagiermaschine, aber etwas agiler fürs Höhen-Regeln
+            target_rate = stick_pitch * np.deg2rad(22.0)
+            self.pitch_rate += (target_rate - self.pitch_rate) * 2.6 * self.dt
         else:
-            # Post-Stall Physik (Vereinfacht: Lift weg, Drag hoch)
-            # Wir behalten Vorzeichen bei, reduzieren aber den Wert
-            sign = np.sign(alpha)
-            cl = cl_linear * 0.3  # Auftrieb bricht ein
+            lift = 0.0
+            cd_stall = 1.2
+            q = 0.5 * self.rho * (v**2)
+            drag = q * self.wing_area * cd_stall
 
-            # Drag explodiert bei 90 Grad AoA (Wand)
-            # Bei 90 Grad trifft der Wind die volle Fläche von unten/oben
-            drag_factor = 1.0 + 10.0 * (abs(alpha) - stall_start)
-            cd = (self.cd0 + self.k * (cl_linear ** 2)) * drag_factor
-            is_stalled = True
+            fx = thrust * np.cos(self.pitch) - drag * np.cos(gamma)
+            fz = thrust * np.sin(self.pitch) - drag * np.sin(gamma) - self.mass * self.gravity
 
-        q = 0.5 * self.rho * (v ** 2)
-        lift = q * self.wing_area * cl
-        drag = q * self.wing_area * cd
-
-        # Kräfte berechnen
-        fx = thrust * np.cos(self.pitch) - drag * np.cos(gamma) - lift * np.sin(gamma)
-        fz = thrust * np.sin(self.pitch) - drag * np.sin(gamma) + lift * np.cos(gamma) - self.mass * self.g
+            # STALL: Kontrolle stark reduziert, aber nicht weg (Recovery möglich)
+            target_rate = stick_pitch * np.deg2rad(5.0)
+            self.pitch_rate += (target_rate - self.pitch_rate) * 4.0 * self.dt
 
         self.vx += (fx / self.mass) * self.dt
         self.vz += (fz / self.mass) * self.dt
         self.altitude += self.vz * self.dt
 
-        # Pitch Rotation
-        target_rate = stick_pitch * np.deg2rad(20.0)  # Etwas agiler (20 deg/s)
-        self.pitch_rate += (target_rate - self.pitch_rate) * 5.0 * self.dt
+        # Pitch-Integration (im Stall ist pitch_rate bereits stark begrenzt)
         self.pitch += self.pitch_rate * self.dt
-
-        # Normalisieren von Pitch zwischen -PI und PI (damit Winkel nicht unendlich wachsen)
         self.pitch = math.atan2(math.sin(self.pitch), math.cos(self.pitch))
 
+        self.speed = np.sqrt(self.vx**2 + self.vz**2)
+        self.vertical_speed = self.vz
         self.ground_offset_x += self.vx * self.dt
-        self.ground_offset_x %= 1000.0
 
-        # --- REWARD ---
+        # --- TERMINATION / TRUNCATION ---
         terminated = False
+        truncated = False
+        crashed = False
+
+        if self.altitude <= 0:
+            self.altitude = 0
+            terminated = True
+            crashed = True
+
+        if self.altitude >= self.max_altitude:
+            terminated = True
+
+        if self.speed > self.max_structural_speed:
+            terminated = True
+
+        # Time limit (wichtig gegen endlose Oszillation)
+        if self.step_counter >= self.max_episode_steps:
+            truncated = True
+
+        # Wenn er sehr lange in "zu langsam / Stall" hängt, beenden wir die Episode
+        if self.speed < self.safe_speed_hard or self.is_stalled_state:
+            self.low_speed_counter += 1
+        else:
+            self.low_speed_counter = 0
+
+        if self.low_speed_counter >= self.low_speed_counter_limit:
+            truncated = True
+
+        # ==================================================
+        #   REWARD: Schnell Richtung Ziel, aber sauber einregeln
+        # ==================================================
         reward = 0.0
 
-        # Altitude
-        dist = abs(self.altitude - self.target_altitude)
-        reward += np.exp(-dist / 30.0) * 1.5
+        alt_error = (self.target_altitude - self.altitude)  # signed
+        abs_error = abs(alt_error)
+        vz = self.vertical_speed
 
-        # Speed (Ziel 70 m/s)
-        speed_diff = abs(self.vx - self.cruise_speed)
-        reward += np.exp(-speed_diff / 10.0) * 0.5
+        # Richtungstreue: belohne Vertikalgeschwindigkeit in Richtung Ziel (nur weit weg)
+        approach = float(np.sign(alt_error) * vz)
+        if abs_error > 80.0:
+            reward += 0.25 * float(np.clip(approach, -35.0, 35.0))
 
-        # Angst vor Langsamflug (Stallgefahr)
-        if self.vx < 60.0: reward -= 0.1
+        # Zeitdruck: er soll nicht "chillen"
+        reward -= 0.18
 
-        # Smoothness
-        action_diff = np.sum(np.abs(action - self.last_action))
-        reward -= action_diff * 0.01
-        self.last_action = action
+        # Progress: stark belohnen, wenn der Höhenfehler schnell abnimmt
+        if self.prev_abs_error is not None:
+            progress = (self.prev_abs_error - abs_error)  # >0 wenn besser
+            reward += 3.5 * (progress / 100.0)
+
+        # Basis: Abstand minimieren (härter, damit 300m nicht "ok" sind)
+        reward -= (abs_error / 80.0)
+
+        # Distanzabhängige Dämpfung/Lookahead: weit weg aggressiv, nah dran vorsichtig
+        scale = float(np.clip(abs_error / 400.0, 0.0, 1.0))  # 1 weit weg, 0 nah dran
+        vz_coef = (0.002 * scale) + (0.012 * (1.0 - scale))
+        reward -= vz_coef * (vz ** 2)
+
+        tau = 1.5
+        pred_alt = self.altitude + vz * tau
+        pred_error = self.target_altitude - pred_alt
+        lookahead_w = (1.0 * scale) + (3.0 * (1.0 - scale))
+        reward -= lookahead_w * (abs(pred_error) / 200.0)
+
+        # Smoothness: Zickzack vermeiden (leichter, damit er nicht zu träge wird)
+        da = self.last_action - self.prev_action
+        reward -= 0.06 * float(np.dot(da, da))
+
+        # Speed-Management
+        v_ref = 110.0
+        reward -= abs(self.speed - v_ref) / 250.0
+
+        if self.speed < self.safe_speed:
+            dv = (self.safe_speed - self.speed)
+            reward -= 0.04 * (dv ** 2)
+
+        # Stall vermeiden (konstant und deutlich)
+        if self.is_stalled_state:
+            reward -= 12.0
+
+        # Zielzone + Streak
+        in_zone = abs_error < 15.0
+        is_stable = (abs(vz) < 3.0) and (abs(self.pitch_rate) < np.deg2rad(3.0))
+
+        if in_zone and is_stable:
+            self.on_target_streak += 1
+            streak_bonus = 1.0 + (self.on_target_streak * 0.08)
+            streak_bonus = min(streak_bonus, 6.0)
+            reward += streak_bonus
+        else:
+            self.on_target_streak = 0
 
         # Crash
-        if self.altitude <= 0:
-            terminated = True
-            reward = -100.0
+        if crashed:
+            reward = -1000.0
 
-        # Kein harter Abbruch mehr bei Loopings, nur Physik und Strafe
-        if is_stalled:
-            reward -= 0.5  # Bestrafung für unsauberen Flug
+        # Update Progress-State
+        self.prev_abs_error = abs_error
 
-        return self._get_obs(action), reward, terminated, False, {}
+        obs = self._get_obs()
+        info = {
+            "height_error": abs_error,
+            "scenario": self.current_scenario,
+            "streak": self.on_target_streak,
+            "vz": float(vz),
+            "pred_error": float(pred_error),
+            "truncated": truncated,
+            "speed": float(self.speed),
+            "stall": bool(self.is_stalled_state),
+            "low_speed_counter": int(self.low_speed_counter),
+        }
+        return obs, float(reward), terminated, truncated, info
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self.step_counter = 0
+        self.is_stalled_state = False
+        self.throttle_actual = 0.5
+        self.pitch_rate = 0.0
+        self.last_action = np.zeros(2, dtype=np.float32)
+        self.prev_action = np.zeros(2, dtype=np.float32)
+        self.last_pitch_input = 0.0
+        self.last_throttle = self.throttle_actual
+
+        # auch vz/vertical_speed sauber zurücksetzen
+        self.vz = 0.0
+        self.vertical_speed = 0.0
+
+        # Streak + Counter zurücksetzen
+        self.on_target_streak = 0
+        self.low_speed_counter = 0
+
+        if self.enable_scenarios and random.random() < 0.8:
+            modes = ["height_change", "on_target", "stall_recovery"]
+            scenario = random.choices(modes, weights=[0.5, 0.3, 0.2])[0]
+            self.current_scenario = scenario
+
+            if scenario == "height_change":
+                self.target_altitude = np.random.uniform(1000, 4000)
+                offset = 300 if random.random() < 0.5 else -300
+                self.altitude = self.target_altitude + offset
+                self.pitch = np.random.uniform(-0.1, 0.1)
+                self.speed = 100.0
+                self.vx = self.speed * math.cos(self.pitch)
+                self.vz = self.speed * math.sin(self.pitch)
+
+            elif scenario == "on_target":
+                self.target_altitude = np.random.uniform(1000, 4000)
+                self.altitude = self.target_altitude
+                self.speed = 90.0
+                self.pitch = 0.0
+                self.vx = self.speed
+                self.vz = 0.0
+
+            elif scenario == "stall_recovery":
+                self.target_altitude = 2000.0
+                self.altitude = 3500.0
+                # Startet "nahe am Stall", aber recoverable
+                self.speed = 65.0
+                self.pitch = 0.18
+                self.vx = self.speed * math.cos(self.pitch)
+                self.vz = self.speed * math.sin(self.pitch)
+                self.is_stalled_state = True
+
+                # etwas mehr Grundschub hilft, dass Recovery reward-mäßig erreichbar ist
+                self.throttle_actual = 0.65
+                self.last_throttle = self.throttle_actual
+        else:
+            self.current_scenario = "normal"
+            self.target_altitude = np.random.uniform(1000, 4000)
+            self.altitude = np.random.uniform(1000, 4000)
+            self.speed = 100.0
+            self.pitch = 0.0
+            self.vx = 100.0
+            self.vz = 0.0
+
+        self.vertical_speed = self.vz
+        self.prev_abs_error = abs(self.target_altitude - self.altitude)
+
+        obs = self._get_obs()
+        return obs, {"scenario": self.current_scenario}
 
     def render(self, flip=True):
         if self.render_mode == "human":
             self._draw(flip)
 
+    # --- Darstellung: unverändert ---
     def _draw(self, do_flip):
         if self.screen is None:
             pygame.init()
-            self.screen = pygame.display.set_mode((1000, 600))
-            pygame.display.set_caption("Flight Sim RL")
+            self.screen = pygame.display.set_mode((self.width, self.height))
             self.font = pygame.font.SysFont("Arial", 16)
             self.clock = pygame.time.Clock()
-
-            # --- BILD LADEN ---
             try:
-                # Versuche das Bild zu laden
-                raw_img = pygame.image.load(self.image_path)
-                # Skalieren auf eine vernünftige Größe (z.B. 80px breit)
-                scale_ratio = 80.0 / raw_img.get_width()
-                new_h = int(raw_img.get_height() * scale_ratio)
-                self.plane_img_original = pygame.transform.smoothscale(raw_img, (80, new_h))
-                print(f"Bild erfolgreich geladen: {self.image_path}")
-            except Exception as e:
-                print(f"FEHLER: Konnte Bild nicht laden: {e}")
-                print("Benutze Standard-Polygon.")
-                self.plane_img_original = None
+                if os.path.exists(self.image_path):
+                    raw_img = pygame.image.load(self.image_path)
+                    scale_ratio = 80.0 / raw_img.get_width()
+                    new_h = int(raw_img.get_height() * scale_ratio)
+                    self.plane_img_original = pygame.transform.smoothscale(raw_img, (80, new_h))
+            except:
+                pass
 
-        self.screen.fill((135, 206, 235))
+        # Himmel-Gradient
+        top = np.array([110, 190, 255], dtype=np.int32)
+        bot = np.array([180, 225, 255], dtype=np.int32)
+        for y in range(self.height):
+            t = y / max(1, self.height - 1)
+            col = (top * (1.0 - t) + bot * t).astype(np.int32)
+            pygame.draw.line(self.screen, col.tolist(), (0, y), (self.width, y))
 
-        screen_h = 600
-        plane_y_screen = screen_h / 2
-        scale = 1.5
-        ground_y_screen = plane_y_screen + (self.altitude * scale)
+        # Boden bleibt fix (immer gleiche Bildschirmhöhe)
+        ground_y = self.height - 80
 
-        pygame.draw.rect(self.screen, (34, 139, 34), (0, ground_y_screen, 1000, 2000))
-        pygame.draw.line(self.screen, (0, 100, 0), (0, ground_y_screen), (1000, ground_y_screen), 2)
+        # Basis-Plane-Position (hoch in der Szene)
+        base_plane_y = self.height // 3
 
-        for pos_meter, type_id in self.scenery:
-            draw_x = (pos_meter - self.ground_offset_x) * scale
-            if draw_x < -50: draw_x += 1000 * scale
-            draw_x += 500
-            draw_x %= (1000 * scale)
+        # Zoom-Faktor (rein/raus zoomen über Höhe):
+        # Je niedriger die Höhe, desto größer wirken Flugzeug & Bodendeko.
+        alt = float(max(0.0, self.altitude))
+        zoom = 0.60 + 2.6 * (1.0 / (1.0 + (alt / 420.0)))
+        zoom = float(np.clip(zoom, 0.5, 3.4))
 
-            rel_x = (pos_meter - self.ground_offset_x)
-            if rel_x < -500: rel_x += 1000
-            if rel_x > 500: rel_x -= 1000
-            final_x = 500 + (rel_x * scale)
-            final_y = ground_y_screen
+        # Plane bewegt sich Richtung Boden bei niedriger Höhe
+        low_alt_range = 1200.0
+        t_low = float(np.clip((low_alt_range - alt) / low_alt_range, 0.0, 1.0))
+        t_low = t_low ** 1.6
 
-            if -50 < final_x < 1050 and -50 < final_y < 700:
-                if type_id == 0:
-                    pygame.draw.rect(self.screen, (100, 50, 0), (final_x, final_y - 15, 6, 15))
-                    pygame.draw.circle(self.screen, (0, 100, 0), (int(final_x + 3), int(final_y - 15)), 12)
-                elif type_id == 1:
-                    pygame.draw.rect(self.screen, (200, 200, 200), (final_x, final_y - 20, 30, 20))
-                    pygame.draw.polygon(self.screen, (150, 0, 0),
-                                        [(final_x, final_y - 20), (final_x + 15, final_y - 35),
-                                         (final_x + 30, final_y - 20)])
-                elif type_id == 2:
-                    pygame.draw.circle(self.screen, (0, 150, 0), (int(final_x), int(final_y)), 8)
+        # --- 1) Erste Schätzung (ohne exakte Sprite-Höhe) ---
+        max_drop_guess = max(0, (ground_y - 120) - base_plane_y)
+        plane_y_guess = int(base_plane_y + t_low * max_drop_guess)
 
-        target_y = plane_y_screen + (self.altitude - self.target_altitude) * scale
-        pygame.draw.line(self.screen, (0, 255, 255), (0, target_y), (1000, target_y), 1)
+        max_dist_guess = (ground_y - 10) - plane_y_guess
+        scale_guess = (max_dist_guess / self.max_altitude) * 1.2
+        scale_guess = float(np.clip(scale_guess, 0.01, 1.5))
 
-        # --- FLUGZEUG ZEICHNEN ---
-        # Rotation umrechnen: Pygame dreht gegen Uhrzeigersinn (positiv),
-        # aber unsere Pitch-Logik ist oft andersrum definiert.
-        # Wir testen: np.rad2deg(self.pitch). Ggf. muss hier ein Minus davor.
-        deg = np.rad2deg(self.pitch)
-
+        # geschätzte visuelle Flugzeuggröße (für Boden-Kontakt)
+        vis_scale_guess = max(0.45, min(1.85, (scale_guess * 3.4) * zoom))
         if self.plane_img_original:
-            # Bild rotieren
-            rotated_img = pygame.transform.rotate(self.plane_img_original, deg)
-            rect = rotated_img.get_rect(center=(500, plane_y_screen))
-            self.screen.blit(rotated_img, rect)
+            w_guess = int(80 * vis_scale_guess)
+            h_guess = int(self.plane_img_original.get_height() * (w_guess / 80))
+            plane_half_h = max(8, h_guess // 2)
         else:
-            # Fallback Polygon
-            plane_surf = pygame.Surface((60, 20), pygame.SRCALPHA)
-            pygame.draw.polygon(plane_surf, (220, 220, 220), [(0, 10), (60, 10), (10, 0)])
-            pygame.draw.polygon(plane_surf, (255, 0, 0), [(0, 10), (15, 10), (5, 0)])
-            pygame.draw.line(plane_surf, (50, 50, 50), (30, 10), (40, 20), 3)
-            rotated = pygame.transform.rotate(plane_surf, deg)
-            rect = rotated.get_rect(center=(500, plane_y_screen))
-            self.screen.blit(rotated, rect)
+            plane_half_h = max(8, int(10 * zoom))
+
+        # --- 2) Final: so, dass bei alt=0 das Flugzeug kurz über dem Boden sitzt ---
+        ground_clearance = 6  # px Abstand zwischen Flugzeug und Bodenlinie
+        max_drop = max(0, (ground_y - ground_clearance - plane_half_h) - base_plane_y)
+        plane_y = int(base_plane_y + t_low * max_drop)
+
+        # Maßstab für Höhen-Mapping (FIX, unabhängig von plane_y Bewegung)
+        # Damit bleibt die Ziel-Linie konsistent und "invertiert" nicht, wenn das Flugzeug nach unten wandert.
+        ref_dist = (ground_y - 10) - base_plane_y
+        scale = (ref_dist / self.max_altitude) * 1.2
+        scale = float(np.clip(scale, 0.01, 1.5))
+
+        # Bodendeko skaliert mit Zoom (Höhe), nicht mit plane_y
+        deco_scale = float(np.clip(scale * 10.0 * zoom, 0.35, 10.0))
+
+        # Wolken (parallax: langsamer als Boden)
+        for cx, cy, size in self.clouds:
+            dx = (cx - self.ground_offset_x * 0.3) * 0.18
+            dx %= (12000.0 * 0.18)
+            x = int(dx - ((12000.0 * 0.18) / 2) + self.width / 2)
+            if -200 < x < self.width + 200:
+                s = int(size * (0.6 + 0.4 * zoom))
+                pygame.draw.ellipse(self.screen, (255, 255, 255), (x, cy, s, int(s * 0.55)))
+                pygame.draw.ellipse(self.screen, (245, 245, 245), (x + int(s * 0.25), cy - int(s * 0.15), int(s * 0.9), int(s * 0.55)))
+
+        # Boden / Horizont
+        pygame.draw.rect(self.screen, (34, 139, 34), (0, ground_y, self.width, self.height - ground_y + 5))
+        pygame.draw.rect(self.screen, (40, 160, 60), (0, ground_y - 10, self.width, 12))
+        pygame.draw.line(self.screen, (0, 100, 0), (0, ground_y), (self.width, ground_y), 2)
+
+        # Bodendeko: Bäume, Häuser, Stadtblöcke (skalieren mit Höhe)
+        for pos, type_id in self.scenery:
+            dx = (pos - self.ground_offset_x) * deco_scale
+            dx %= (5000.0 * deco_scale)
+            final_x = int(dx - ((5000.0 * deco_scale) / 2) + self.width / 2)
+            if -160 < final_x < self.width + 160:
+                if type_id == 0:
+                    # Wald / Baum
+                    r = int(14 * deco_scale)
+                    r = max(2, r)
+                    pygame.draw.circle(self.screen, (0, 110, 0), (final_x, ground_y - int(18 * deco_scale)), r)
+                    pygame.draw.rect(self.screen, (90, 60, 30), (final_x - max(1, r // 6), ground_y - int(10 * deco_scale), max(2, r // 3), int(10 * deco_scale)))
+                elif type_id == 1:
+                    # Einzelhaus
+                    w = max(6, int(36 * deco_scale))
+                    h = max(6, int(26 * deco_scale))
+                    pygame.draw.rect(self.screen, (210, 210, 210), (final_x, ground_y - h, w, h))
+                    pygame.draw.rect(self.screen, (160, 160, 160), (final_x, ground_y - h, w, max(2, h // 10)))
+                else:
+                    # Stadtblock / Skyline-Cluster
+                    w = max(10, int(70 * deco_scale))
+                    h = max(10, int(45 * deco_scale))
+                    base_y = ground_y
+                    pygame.draw.rect(self.screen, (170, 170, 185), (final_x, base_y - h, w, h))
+                    # Fenster
+                    fw = max(2, int(3 * deco_scale))
+                    fh = max(2, int(4 * deco_scale))
+                    for wx in range(final_x + fw, final_x + w - fw, max(4, fw * 3)):
+                        for wy in range(base_y - h + fh, base_y - fh, max(6, fh * 3)):
+                            pygame.draw.rect(self.screen, (230, 230, 210), (wx, wy, fw, fh))
+
+        tgt_y = int(plane_y - ((self.target_altitude - self.altitude) * scale))
+
+        in_zone = self.on_target_streak > 0
+        tgt_col = (255, 215, 0) if in_zone else (0, 255, 255)
+        line_width = 4 if in_zone else 2
+
+        if -5000 < tgt_y < 5000:
+            if 0 < tgt_y < self.height:
+                pygame.draw.line(self.screen, tgt_col, (0, tgt_y), (self.width, tgt_y), line_width)
+                if in_zone:
+                    streak_txt = self.font.render(f"STREAK: {self.on_target_streak}", True, (255, 215, 0))
+                    self.screen.blit(streak_txt, (self.width / 2 + 20, tgt_y - 20))
+            else:
+                txt = f"Target {'^' if tgt_y < 0 else 'v'} {int(self.target_altitude)}m"
+                self.screen.blit(
+                    self.font.render(txt, True, tgt_col),
+                    (self.width / 2 - 40, 20 if tgt_y < 0 else self.height - 30),
+                )
+
+        deg = np.rad2deg(self.pitch)
+        if self.plane_img_original:
+            vis_scale = max(0.45, min(1.85, (scale * 3.4) * zoom))
+            w = int(80 * vis_scale)
+            h = int(self.plane_img_original.get_height() * (w / 80))
+            scaled = pygame.transform.smoothscale(self.plane_img_original, (w, h))
+            rot = pygame.transform.rotate(scaled, deg)
+        else:
+            surf = pygame.Surface((int(60 * zoom), int(20 * zoom)), pygame.SRCALPHA)
+            pygame.draw.ellipse(surf, (200, 200, 200), (0, 0, int(60 * zoom), int(20 * zoom)))
+            rot = pygame.transform.rotate(surf, deg)
+        self.screen.blit(rot, rot.get_rect(center=(self.width // 2, plane_y)))
+
+        if self.is_stalled_state:
+            warn = self.font.render("!! STALL !!", True, (255, 0, 0))
+            self.screen.blit(warn, (self.width / 2 - 30, self.height / 2 - 50))
 
         if do_flip:
             pygame.display.flip()
             self.clock.tick(60)
 
     def close(self):
-        if self.screen: pygame.quit()
+        if self.screen:
+            pygame.quit()
