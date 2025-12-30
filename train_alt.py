@@ -1,82 +1,113 @@
-# train_alt.py
 import os
-
-# MAC CRASH FIX
-os.environ["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"] = "YES"
-
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.vec_env import VecNormalize
-
+from stable_baselines3.common.vec_env import VecNormalize, SubprocVecEnv
+from stable_baselines3.common.callbacks import EvalCallback
 from airplane_alt_env import AirplaneAltitudeEnv
 
-# --- KONFIGURATION ---
-BASE_DIR = "./airplane_project_data"
-LOG_DIR = os.path.join(BASE_DIR, "logs")
-MODEL_DIR = os.path.join(BASE_DIR, "models")
-VECNORM_DIR = os.path.join(BASE_DIR, "vecnormalize")
+os.environ["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"] = "YES"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+
+BASE_LOG_DIR = "altitude_agent"
 
 
-def get_next_run_id(save_path):
-    if not os.path.exists(save_path):
+def get_next_run_number(base_path):
+    if not os.path.exists(base_path):
         return 1
-    max_id = 0
-    for folder_name in os.listdir(save_path):
-        if folder_name.startswith("run_"):
-            try:
-                current_id = int(folder_name.split("_")[1])
-                if current_id > max_id:
-                    max_id = current_id
-            except:
-                pass
-    return max_id + 1
+    runs = [d for d in os.listdir(base_path) if d.startswith("run_")]
+    if not runs:
+        return 1
+    numbers = []
+    for r in runs:
+        try:
+            numbers.append(int(r.split("_")[1]))
+        except Exception:
+            continue
+    return max(numbers) + 1 if numbers else 1
 
 
 def make_env():
-    return AirplaneAltitudeEnv(render_mode="none", enable_scenarios=True, max_episode_steps=3000)
+    return AirplaneAltitudeEnv(render_mode="none")
 
 
-def main():
-    os.makedirs(LOG_DIR, exist_ok=True)
-    os.makedirs(MODEL_DIR, exist_ok=True)
-    os.makedirs(VECNORM_DIR, exist_ok=True)
+def train():
+    run_id = get_next_run_number(BASE_LOG_DIR)
+    run_folder = os.path.join(BASE_LOG_DIR, f"run_{run_id}")
+    log_path = os.path.join(run_folder, "logs")
+    os.makedirs(run_folder, exist_ok=True)
 
-    run_id = get_next_run_id(MODEL_DIR)
-    run_name = f"run_{run_id}"
+    print(f"🚀 Starte Training (Run {run_id}) auf M2")
 
-    current_model_dir = os.path.join(MODEL_DIR, run_name)
-    current_vecnorm_path = os.path.join(VECNORM_DIR, f"{run_name}_vecnorm.pkl")
-    os.makedirs(current_model_dir, exist_ok=True)
+    # Paralleles Training (8 Prozesse) – nutzt M2 besser aus
+    env = make_vec_env(
+        make_env,
+        n_envs=8,
+        vec_env_cls=SubprocVecEnv
+    )
 
-    env = make_vec_env(make_env, n_envs=4)
-    env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10.0)
+    env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=100.)
+
+    eval_env = make_vec_env(make_env, n_envs=1)
+    eval_env = VecNormalize(
+        eval_env,
+        norm_obs=True,
+        norm_reward=False,
+        clip_obs=100.,
+        training=False
+    )
+
+    class SyncVecNormalizeCallback(EvalCallback):
+        def _on_step(self) -> bool:
+            if hasattr(self.eval_env, 'ret_rms') and hasattr(self.training_env, 'ret_rms'):
+                self.eval_env.ret_rms = self.training_env.ret_rms
+            if hasattr(self.eval_env, 'obs_rms') and hasattr(self.training_env, 'obs_rms'):
+                self.eval_env.obs_rms = self.training_env.obs_rms
+            return super()._on_step()
+
+    eval_callback = SyncVecNormalizeCallback(
+        eval_env,
+        best_model_save_path=run_folder,
+        log_path=run_folder,
+        eval_freq=10_000,
+        deterministic=True,
+        render=False,
+        verbose=1
+    )
 
     model = PPO(
         "MlpPolicy",
         env,
-        verbose=1,
-        learning_rate=3e-4,
-        n_steps=1024,
+        learning_rate=0.0003,
+        n_steps=2048,
         batch_size=64,
-        ent_coef=0.01,
+        n_epochs=10,
+        gamma=0.99,
+        gae_lambda=0.95,
+        clip_range=0.2,
+        ent_coef=0.0,
         vf_coef=0.5,
-        tensorboard_log=os.path.join(BASE_DIR, "tensorboard"),
+        max_grad_norm=0.5,
+        use_sde=False,
+        normalize_advantage=True,
+        tensorboard_log=log_path,
+        verbose=1
     )
 
-    try:
-        model.learn(total_timesteps=1_500_000, tb_log_name=run_name)
-    except KeyboardInterrupt:
-        print("Abbruch durch User...")
+    total_timesteps = 10_000_000
+    print(f"Training startet für {total_timesteps} Steps...")
 
-    final_path = os.path.join(current_model_dir, "model_final")
-    model.save(final_path)
-    env.save(current_vecnorm_path)
+    model.learn(
+        total_timesteps=total_timesteps,
+        callback=eval_callback,
+        tb_log_name="PPO_Altitude_Fixed"
+    )
 
-    print(f"Gespeichert: {final_path}.zip")
-    print(f"VecNormalize: {current_vecnorm_path}")
+    model.save(os.path.join(run_folder, "model_final"))
+    env.save(os.path.join(run_folder, "vecnorm.pkl"))
 
-    env.close()
+    print("✅ Training beendet.")
+    return run_folder
 
 
 if __name__ == "__main__":
-    main()
+    train()

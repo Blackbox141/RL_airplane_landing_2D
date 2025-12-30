@@ -30,7 +30,7 @@ class AirplaneAltitudeEnv(gym.Env):
         self.width = 1000
         self.height = 600
 
-        # --- OPTIK ---
+        # Flugzeug laden
         self.image_path = r"/Users/dennis/PycharmProjects/RL Lander V2/Flugzeug.svg"
         self.plane_img_original = None
         self.font = None
@@ -53,7 +53,7 @@ class AirplaneAltitudeEnv(gym.Env):
         # Variable für sanften Kamera-Zoom der Umgebung
         self.render_view_height = 500.0
 
-        # --- PHYSIK & STEUERUNG ---
+        # PHYSIK & STEUERUNG
         self.dt = 0.05
         self.gravity = 9.81
         self.rho = 1.225
@@ -87,8 +87,8 @@ class AirplaneAltitudeEnv(gym.Env):
             dtype=np.float32,
         )
 
-        low_obs = np.array([-np.pi, 0, 0, -300, -5000], dtype=np.float32)
-        high_obs = np.array([np.pi, self.max_speed, self.max_altitude, 300, 5000], dtype=np.float32)
+        low_obs = np.array([-np.pi, 0, 0, -300, -5000, 0], dtype=np.float32)
+        high_obs = np.array([np.pi, self.max_speed, self.max_altitude, 300, 5000, 1], dtype=np.float32)
         self.observation_space = spaces.Box(low=low_obs, high=high_obs, dtype=np.float32)
 
         self.pitch = 0.0
@@ -112,16 +112,15 @@ class AirplaneAltitudeEnv(gym.Env):
         self.prev_abs_error = None
 
     def _get_obs(self):
-        return np.array(
-            [
-                self.pitch, #Ausrichtung der "Nase" des Flugzeugs
-                self.speed, #Geschwindigkeit, welche den Auftrieb beeinflusst
-                self.altitude, #Höhe über dem Boden
-                self.vertical_speed, #Vertikalgeschwindigkeit - zeigt, ob das Flugzeug steigt oder sinkt
-                self.target_altitude - self.altitude, #Differenz zwischen Zielhöhe und aktueller Höhe
-            ],
-            dtype=np.float32,
-        )
+        obs = np.array([
+            self.pitch,  # Ausrichtung der "Nase" des Flugzeugs
+            self.speed,  # Geschwindigkeit (welche auch den Auftrieb beeinflusst)
+            self.altitude,  # Höhe über dem Boden
+            self.vertical_speed,  # Vertikalgeschwindigkeit - zeigt, ob das Flugzeug steigt oder sinkt
+            self.target_altitude - self.altitude,  # Höhenfehler von Zielhöhe zur aktuellen Höhe
+            1.0 if self.is_stalled_state else 0.0,  # Stall-Zustand
+        ], dtype=np.float32)
+        return obs
 
     def step(self, action):
         self.step_counter += 1
@@ -131,10 +130,11 @@ class AirplaneAltitudeEnv(gym.Env):
         stick_throttle = float(np.clip(action[1], -1.0, 1.0))
         self.last_pitch_input = stick_pitch
         self.last_action = np.array([stick_pitch, stick_throttle], dtype=np.float32)
+        was_stalled = self.is_stalled_state
 
-        # --- PHYSIK ---
+        # PHYSIK
         target_thr = (stick_throttle + 1.0) / 2.0
-        self.throttle_actual += (target_thr - self.throttle_actual) * 0.4 * self.dt
+        self.throttle_actual += (target_thr - self.throttle_actual) * 1.0 * self.dt
         self.throttle_actual = np.clip(self.throttle_actual, 0.0, 1.0)
         self.last_throttle = self.throttle_actual
 
@@ -161,8 +161,8 @@ class AirplaneAltitudeEnv(gym.Env):
             drag = q * self.wing_area * cd
             fx = thrust * np.cos(self.pitch) - drag * np.cos(gamma) - lift * np.sin(gamma)
             fz = thrust * np.sin(self.pitch) - drag * np.sin(gamma) + lift * np.cos(gamma) - self.mass * self.gravity
-            target_rate = stick_pitch * np.deg2rad(22.0)
-            self.pitch_rate += (target_rate - self.pitch_rate) * 2.6 * self.dt
+            target_rate = stick_pitch * np.deg2rad(35.0)
+            self.pitch_rate += (target_rate - self.pitch_rate) * 3.5 * self.dt
         else:
             lift = 0.0
             cd_stall = 1.2
@@ -170,7 +170,7 @@ class AirplaneAltitudeEnv(gym.Env):
             drag = q * self.wing_area * cd_stall
             fx = thrust * np.cos(self.pitch) - drag * np.cos(gamma)
             fz = thrust * np.sin(self.pitch) - drag * np.sin(gamma) - self.mass * self.gravity
-            target_rate = stick_pitch * np.deg2rad(5.0)
+            target_rate = stick_pitch * np.deg2rad(12.0)
             self.pitch_rate += (target_rate - self.pitch_rate) * 4.0 * self.dt
 
         self.vx += (fx / self.mass) * self.dt
@@ -184,7 +184,7 @@ class AirplaneAltitudeEnv(gym.Env):
         self.vertical_speed = self.vz
         self.ground_offset_x += self.vx * self.dt
 
-        # --- TERMINATION ---
+        # TERMINATION
         terminated = False
         truncated = False
         crashed = False
@@ -214,61 +214,88 @@ class AirplaneAltitudeEnv(gym.Env):
         else:
             self.low_speed_counter = 0
 
-        # --- REWARD ---
+        # REWARD
         reward = 0.0
-        alt_error = (self.target_altitude - self.altitude)
+
+        alt_error = self.target_altitude - self.altitude
         abs_error = abs(alt_error)
         vz = self.vertical_speed
 
-        approach = float(np.sign(alt_error) * vz)
-        if abs_error > 80.0:
-            reward += 0.25 * float(np.clip(approach, -35.0, 35.0))
+        # Zielhöhe bestimmen
+        in_target_band = abs_error <= 50.0
 
-        reward -= 0.18
+        # Zielhöhe erreicht?
+        just_entered_target = (
+            in_target_band
+            and (self.prev_abs_error is not None)
+            and (self.prev_abs_error > 50.0)
+        )
 
-        if self.prev_abs_error is not None:
-            progress = (self.prev_abs_error - abs_error)
-            reward += 3.5 * (progress / 100.0)
+        # 1) Aufenthalts-Reward im Zielbereich (pro Schritt)
+        if in_target_band:
+            # Guter Reward im Zielbereich, aber moderat skaliert
+            reward += 4.0
+        else:
+            # Basisstrafe, wenn der Zielbereich verlassen ist
+            reward -= 1.0
 
-        reward -= (abs_error / 80.0)
-
-        scale_r = float(np.clip(abs_error / 400.0, 0.0, 1.0))
-        vz_coef = (0.002 * scale_r) + (0.012 * (1.0 - scale_r))
-        reward -= vz_coef * (vz ** 2)
-
-        tau = 1.5
-        pred_alt = self.altitude + vz * tau
-        pred_error = self.target_altitude - pred_alt
-        lookahead_w = (1.0 * scale_r) + (3.0 * (1.0 - scale_r))
-        reward -= lookahead_w * (abs(pred_error) / 200.0)
-
-        da = self.last_action - self.prev_action
-        reward -= 0.06 * float(np.dot(da, da))
-
-        v_ref = 110.0
-        reward -= abs(self.speed - v_ref) / 250.0
-
-        if self.speed < self.safe_speed:
-            dv = (self.safe_speed - self.speed)
-            reward -= 0.04 * (dv ** 2)
-
-        if self.is_stalled_state:
-            reward -= 12.0
-
-        in_zone = abs_error < 15.0
-        is_stable = (abs(vz) < 3.0) and (abs(self.pitch_rate) < np.deg2rad(3.0))
-
-        if in_zone and is_stable:
+        # 1b) Streak-Bonus: je länger im Zielbereich, desto höher der Zusatz-Reward
+        if in_target_band:
             self.on_target_streak += 1
-            streak_bonus = 1.0 + (self.on_target_streak * 0.08)
-            streak_bonus = min(streak_bonus, 6.0)
+            # Wachsender Bonus, aber begrenzt, um Ausreißer zu vermeiden
+            streak_bonus = min(self.on_target_streak * 0.15, 6.0)
             reward += streak_bonus
         else:
             self.on_target_streak = 0
 
-        if crashed:
-            reward = -1000.0
+        # 1c) Einmaliger Bonus beim neu Erreichen des Zielbands (nur wenn nicht gestallt oder gecrasht)
+        if just_entered_target and (not self.is_stalled_state) and (not crashed):
+            reward += 80.0
 
+        # 2) Reward für Annäherung / Entfernen vom Ziel (nur wenn nicht gestallt)
+        if self.prev_abs_error is not None and not self.is_stalled_state:
+            # progress > 0: Fehler wird kleiner (Annäherung)
+            # progress < 0: Fehler wird größer (Entfernung)
+            progress = self.prev_abs_error - abs_error
+            reward += 0.5 * (progress / 50.0)
+
+        # 2b) Sofortiger Reward basierend auf Vertikalgeschwindigkeit relativ zur Zielhöhe
+        # Je schneller sich das Flugzeug der Zielhöhe nähert, desto positiver der Reward.
+        # Gleicher Abstand, aber Bewegung VOM Ziel weg -> negativer Reward.
+        if not self.is_stalled_state:
+            # approach > 0: Bewegung in Richtung Zielhöhe
+            # approach < 0: Bewegung weg von der Zielhöhe
+            approach = float(np.sign(alt_error) * vz)
+            # Nur außerhalb des Zielbands und innerhalb eines sinnvollen Abstandsbereichs
+            if (not in_target_band) and (abs_error <= 2000.0):
+                # Je näher am Ziel, desto stärker die Gewichtung
+                proximity = (2000.0 - abs_error) / 2000.0  # 0 (weit weg) .. 1 (nah dran)
+                proximity = float(np.clip(proximity, 0.0, 1.0))
+                approach_clipped = float(np.clip(approach, -30.0, 30.0))
+                # Positiv, wenn sich das Vorzeichen von vz und alt_error "richtig" kombinieren,
+                # negativ, wenn es vom Ziel weg zeigt.
+                reward += 0.25 * proximity * (approach_clipped / 10.0)
+
+        # 3) Zusätzliche Strafe für große Abweichungen,
+        #    damit der Agent nicht weit vom Ziel "herumfliegt".
+        reward -= (abs_error / 400.0)
+
+        # 4) Stall-Penalty: negativer Reward pro Zeitschritt im Stall
+        if self.is_stalled_state:
+            reward -= 10.0
+            if not was_stalled:
+                reward -= 1000.0
+
+        # 4b) Bonus beim Verlassen des Stall-Zustands (z.B. in Recovery-Szenarien)
+        # Nur wenn der Agent zuvor im Stall war und jetzt nicht mehr, und kein Crash vorliegt.
+        if was_stalled and (not self.is_stalled_state) and (not crashed):
+            reward += 150.0
+
+        # 5) Crash-Penalty überschreibt alles
+        if crashed:
+            reward = -10000.0
+
+        # Fehler für den nächsten Schritt merken
         self.prev_abs_error = abs_error
 
         obs = self._get_obs()
@@ -299,15 +326,28 @@ class AirplaneAltitudeEnv(gym.Env):
         self.on_target_streak = 0
         self.low_speed_counter = 0
 
-        if self.enable_scenarios and random.random() < 0.8:
-            modes = ["height_change", "on_target", "stall_recovery_too_high", "stall_recovery_too_low"]
-            scenario = random.choices(modes, weights=[0.5, 0.3, 0.1, 0.1])[0]
+        if self.enable_scenarios and random.random() < 0.9:
+            modes = [
+                "height_change",
+                "on_target",
+                "stall_recovery_too_high",
+                "stall_recovery_too_low",
+                "stall_recovery_pitch_thrust",
+                "stall_recovery_hold_nose_down",
+            ]
+            scenario = random.choices(
+                modes,
+                weights=[0.55, 0.15, 0.05, 0.05, 0.1, 0.1],
+            )[0]
             self.current_scenario = scenario
 
             if scenario == "height_change":
                 self.target_altitude = np.random.uniform(1000, 4000)
-                offset = 500 if random.random() < 0.5 else -500
+                offset = np.random.uniform(-2500.0, 2500.0)
                 self.altitude = self.target_altitude + offset
+                min_start_alt = 200.0
+                if self.altitude < min_start_alt:
+                    self.altitude = min_start_alt
                 self.pitch = np.random.uniform(-0.1, 0.1)
                 self.speed = 100.0
                 self.vx = self.speed * math.cos(self.pitch)
@@ -333,14 +373,36 @@ class AirplaneAltitudeEnv(gym.Env):
                 self.last_throttle = self.throttle_actual
 
             elif scenario == "stall_recovery_too_low":
-                self.target_altitude = 20000.0
-                self.altitude = 8500.0
+                self.target_altitude = 10000.0
+                self.altitude = 5000.0
                 self.speed = 35.0
                 self.pitch = 0.30
                 self.vx = self.speed * math.cos(self.pitch)
                 self.vz = self.speed * math.sin(self.pitch)
                 self.is_stalled_state = True
                 self.throttle_actual = 0.65
+                self.last_throttle = self.throttle_actual
+
+            elif scenario == "stall_recovery_pitch_thrust":
+                self.target_altitude = 8000.0
+                self.altitude = 6500.0
+                self.speed = 50.0
+                self.pitch = 0.40
+                self.vx = self.speed
+                self.vz = 0.0
+                self.is_stalled_state = True
+                self.throttle_actual = 0.4
+                self.last_throttle = self.throttle_actual
+
+            elif scenario == "stall_recovery_hold_nose_down":
+                self.target_altitude = 12000.0
+                self.altitude = 7000.0
+                self.speed = 30.0
+                self.pitch = -0.90
+                self.vx = self.speed
+                self.vz = 0.0
+                self.is_stalled_state = True
+                self.throttle_actual = 1
                 self.last_throttle = self.throttle_actual
         else:
             self.current_scenario = "normal"
@@ -353,8 +415,6 @@ class AirplaneAltitudeEnv(gym.Env):
 
         self.vertical_speed = self.vz
         self.prev_abs_error = abs(self.target_altitude - self.altitude)
-
-        # Kamera Reset
         self.render_view_height = max(self.altitude * 1.5, 200.0)
 
         obs = self._get_obs()
@@ -387,8 +447,7 @@ class AirplaneAltitudeEnv(gym.Env):
             col = (top * (1.0 - t) + bot * t).astype(np.int32)
             pygame.draw.line(self.screen, col.tolist(), (0, y), (self.width, y))
 
-        # --- KAMERA LOGIK ---
-        # 1. Glättung für View-Height (bestimmt Zoom für Boden/Hintergrund)
+        # KAMERA LOGIK
         target_view_height = max(self.altitude * 1.8, 200.0)
         self.render_view_height += (target_view_height - self.render_view_height) * 0.05
 
@@ -396,15 +455,13 @@ class AirplaneAltitudeEnv(gym.Env):
         pixels_per_meter = screen_h_avail / self.render_view_height
 
         ground_screen_y = self.height - 40
-        # Flugzeug Y-Position relativ zum Boden (wichtig für Boden-Abstandswahrnehmung)
         plane_screen_y = int(ground_screen_y - (self.altitude * pixels_per_meter))
 
-        # Scale für Deko-Objekte
         base_ppm = screen_h_avail / 200.0
         visual_scale = pixels_per_meter / base_ppm
         visual_scale = float(np.clip(visual_scale, 0.0001, 2.0))
 
-        # --- WOLKEN ---
+        # WOLKEN
         for cx, cy, size in self.clouds:
             dx = (cx - self.ground_offset_x * 0.3) * 0.18
             dx %= (12000.0 * 0.18)
@@ -413,7 +470,7 @@ class AirplaneAltitudeEnv(gym.Env):
                 s = int(size * (0.5 + 0.5 * visual_scale))
                 pygame.draw.ellipse(self.screen, (255, 255, 255), (x, cy, s, int(s * 0.55)))
 
-        # --- BODEN ---
+        # BODEN
         pygame.draw.rect(self.screen, (34, 139, 34), (0, ground_screen_y, self.width, self.height - ground_screen_y))
         pygame.draw.line(self.screen, (0, 100, 0), (0, ground_screen_y), (self.width, ground_screen_y), 3)
 
@@ -447,7 +504,7 @@ class AirplaneAltitudeEnv(gym.Env):
                     h = get_dim(4.0)
                     pygame.draw.rect(self.screen, (170, 170, 185), (obj_screen_x - w // 2, base_y - h, w, h))
 
-        # --- TARGET LINE ---
+        # TARGET LINE
         tgt_screen_y = int(ground_screen_y - (self.target_altitude * pixels_per_meter))
         in_zone = self.on_target_streak > 0
         tgt_col = (255, 215, 0) if in_zone else (0, 255, 255)
@@ -463,14 +520,9 @@ class AirplaneAltitudeEnv(gym.Env):
             py = 20 if tgt_screen_y < 0 else self.height - 30
             self.screen.blit(self.font.render(txt, True, tgt_col), (self.width / 2 - 40, py))
 
-        # --- FLUGZEUG ---
-        # 1. Größe NUR von Höhe abhängig (nicht Geschwindigkeit, nicht Kamera-Smoothness)
-        # Kurve: 1.0 (Boden) -> 0.0 (Unendlich).
-        # Halbwertshöhe z.B. 400m. D.h. bei 400m ist das Flugzeug halb so groß wie am Boden.
+        # FLUGZEUG
         current_alt = max(0.0, self.altitude)
         size_factor = 1.0 / (1.0 + current_alt / 400.0)
-
-        # Max Größe am Boden: 95px, Min Größe in Stratosphäre: 25px
         max_px = 95
         min_px = 25
         plane_w = int(min_px + (max_px - min_px) * size_factor)

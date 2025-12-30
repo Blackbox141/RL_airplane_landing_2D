@@ -19,7 +19,7 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-st.title("📊 KI-Pilot Trainings-Statistiken")
+st.title("Trainings-Statistiken")
 
 # 1. Prüfen ob der Hauptordner existiert
 if not os.path.exists(BASE_DIR):
@@ -37,7 +37,6 @@ if not run_folders:
 # Auswahl in der Seitenleiste
 selected_run = st.sidebar.selectbox("Wähle einen Run (Training):", run_folders)
 st.sidebar.markdown("---")
-st.sidebar.info("Diese Ansicht ist rein informativ und nutzt kein Pygame.")
 
 
 # --- FUNKTION: TENSORBOARD DATEN LADEN ---
@@ -76,7 +75,7 @@ if error:
 elif metrics:
     # 1. REWARD (Hauptfortschritt)
     if 'rollout/ep_rew_mean' in metrics:
-        st.subheader("📈 Gesamter Lernfortschritt (Mean Reward)")
+        st.subheader("Gesamter Lernfortschritt (Mean Reward)")
         df = metrics['rollout/ep_rew_mean']
 
         # Plotly Graph
@@ -98,7 +97,7 @@ elif metrics:
     with col1:
         # Entropy: Wie sicher ist sich die KI?
         if 'train/entropy_loss' in metrics:
-            st.subheader("🧠 Entscheidungs-Sicherheit")
+            st.subheader("Entscheidungs-Sicherheit")
             df = metrics['train/entropy_loss']
             fig_ent = go.Figure(go.Scatter(x=df['Step'], y=df['Value'], line=dict(color='orange')))
             fig_ent.update_layout(template="plotly_dark", title="Entropy Loss")
@@ -108,7 +107,7 @@ elif metrics:
     with col2:
         # Value Loss: Wie gut schätzt die KI die Situation ein?
         if 'train/value_loss' in metrics:
-            st.subheader("📉 Vorhersage-Genauigkeit")
+            st.subheader("Vorhersage-Genauigkeit")
             df = metrics['train/value_loss']
             fig_val = go.Figure(go.Scatter(x=df['Step'], y=df['Value'], line=dict(color='red')))
             fig_val.update_layout(template="plotly_dark", title="Value Loss")
